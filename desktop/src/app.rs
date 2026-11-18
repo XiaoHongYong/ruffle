@@ -442,6 +442,9 @@ pub struct App {
     event_loop_proxy: EventLoopProxy<RuffleEvent>,
     preferences: GlobalPreferences,
     font_database: fontdb::Database,
+    /// Finder may deliver `openURLs` before the main window exists.
+    #[cfg(target_os = "macos")]
+    pending_open: Option<(ContentDescriptor, Box<LaunchOptions>)>,
 }
 
 /// Enters the tokio runtime context.
@@ -467,6 +470,9 @@ impl App {
         let event_loop_proxy = event_loop.create_proxy();
         let runtime = tokio::runtime::Runtime::new()?;
 
+        #[cfg(target_os = "macos")]
+        crate::macos::install_open_urls_handler(event_loop_proxy.clone(), preferences.clone());
+
         Ok((
             Self {
                 main_window: None,
@@ -475,6 +481,8 @@ impl App {
                 event_loop_proxy,
                 font_database,
                 preferences,
+                #[cfg(target_os = "macos")]
+                pending_open: None,
             },
             event_loop,
         ))
@@ -551,7 +559,12 @@ impl ApplicationHandler<RuffleEvent> for App {
                 gui.file_picker(),
             );
 
-            if let Some(movie_url) = &movie_url {
+            #[cfg(target_os = "macos")]
+            let pending_open = self.pending_open.take();
+            #[cfg(not(target_os = "macos"))]
+            let pending_open: Option<(ContentDescriptor, Box<LaunchOptions>)> = None;
+
+            let opened_from_os = if let Some(movie_url) = &movie_url {
                 gui.create_movie(
                     &mut player,
                     LaunchOptions::from(&preferences),
@@ -560,13 +573,19 @@ impl ApplicationHandler<RuffleEvent> for App {
                         root_content_path: None,
                     },
                 );
+                true
+            } else if let Some((desc, options)) = pending_open {
+                // Finder may deliver openURLs before the window exists.
+                gui.create_movie(&mut player, *options, desc);
+                true
             } else {
                 gui.show_open_dialog();
-            }
+                false
+            };
 
             let mut loaded = LoadingState::Loading;
 
-            if movie_url.is_none() {
+            if movie_url.is_none() && !opened_from_os {
                 // No SWF provided on command line; show window with dummy movie immediately.
                 window.set_visible(true);
                 loaded = LoadingState::Loaded;
@@ -639,6 +658,11 @@ impl ApplicationHandler<RuffleEvent> for App {
                 main_window
                     .gui
                     .create_movie(&mut main_window.player, *options, desc);
+            }
+
+            #[cfg(target_os = "macos")]
+            (None, RuffleEvent::Open(desc, options)) => {
+                self.pending_open = Some((desc, options));
             }
 
             (Some(main_window), RuffleEvent::OpenDialog(descriptor)) => {

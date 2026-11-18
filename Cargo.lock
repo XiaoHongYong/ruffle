@@ -4855,6 +4855,8 @@ dependencies = [
  "gilrs",
  "image",
  "memmap2",
+ "objc2 0.5.3",
+ "objc2-foundation 0.2.2",
  "os_info",
  "rand",
  "rfd",
