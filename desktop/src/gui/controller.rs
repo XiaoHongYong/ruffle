@@ -16,12 +16,14 @@ use ruffle_frontend_utils::content::ContentDescriptor;
 use ruffle_render_wgpu::backend::{
     WgpuRenderBackend, create_wgpu_instance, request_adapter_and_device,
 };
+use ruffle_render_wgpu::clap::GraphicsBackend;
 use ruffle_render_wgpu::descriptors::Descriptors;
 use ruffle_render_wgpu::utils::{format_list, get_backend_names};
 use std::any::Any;
 use std::fs::File;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
-use std::sync::{Arc, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use url::Url;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
@@ -61,56 +63,52 @@ impl GuiController {
         initial_movie_url: Option<Url>,
         no_gui: bool,
     ) -> anyhow::Result<Self> {
-        let (instance, backend) =
-            select_wgpu_backend(preferences.graphics_backends().into(), &window)?;
-        let surface = instance.create_surface(window.clone())?;
-        let (adapter, device, queue) = futures::executor::block_on(request_adapter_and_device(
-            backend,
-            &instance,
-            Some(&surface),
-            preferences.graphics_power_preference().into(),
-        ))
-        .map_err(|e| anyhow!(e.to_string()))?;
-        let adapter_info = adapter.get_info();
-        tracing::info!(
-            "Using graphics API {} on {} (type: {:?})",
-            adapter_info.backend.to_str(),
-            adapter_info.name,
-            adapter_info.device_type
-        );
-        let preferred_formats = [
-            // by egui
-            wgpu::TextureFormat::Rgba8Unorm,
-            wgpu::TextureFormat::Bgra8Unorm,
-        ];
-        let supported_formats = surface.get_capabilities(&adapter).formats;
-        let surface_format = preferred_formats
-            .iter()
-            .find(|format| supported_formats.contains(format))
-            .copied()
-            .unwrap_or_else(|| {
-                supported_formats
-                    .first()
-                    .copied()
-                    .expect("At least one format should be supported")
-            });
-        tracing::info!("Using surface format {:?}", surface_format);
+        let selected_backend = preferences.graphics_backends();
+        let preferred: wgpu::Backends = selected_backend.into();
+
+        // Default: try PRIMARY first, then other backends (notably OpenGL).
+        // Explicit `-g dx12` / prefs stay pinned so we don't silently override the user.
+        // Needed because 32-bit DX12 often fails CreatePipelineState with 0x80070057.
+        let candidates: Vec<wgpu::Backends> = if selected_backend == GraphicsBackend::Default {
+            backend_try_order(preferred)
+        } else {
+            preferred.iter().collect()
+        };
+
+        let power_preference = preferences.graphics_power_preference().into();
+        let mut last_error: Option<String> = None;
+        let mut gpu = None;
+        for backend in candidates {
+            match try_create_gpu_stack(backend, window.clone(), power_preference, no_gui) {
+                Ok(created) => {
+                    gpu = Some(created);
+                    break;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "Backend {} failed GPU init: {error}",
+                        format_list(&get_backend_names(backend), "and")
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+
+        let GpuStack {
+            descriptors,
+            surface,
+            surface_format,
+            movie_view_renderer,
+            egui_renderer,
+        } = gpu.ok_or_else(|| {
+            anyhow!(
+                "No compatible graphics backends could create a render pipeline. Last error: {}",
+                last_error.unwrap_or_else(|| "none".to_string())
+            )
+        })?;
+        let descriptors = Arc::new(descriptors);
         let size = window.inner_size();
-        surface.configure(
-            &device,
-            &wgpu::SurfaceConfiguration {
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                format: surface_format,
-                color_space: wgpu::SurfaceColorSpace::Auto,
-                width: size.width,
-                height: size.height,
-                present_mode: Default::default(),
-                desired_maximum_frame_latency: 2,
-                alpha_mode: Default::default(),
-                view_formats: Default::default(),
-            },
-        );
-        let descriptors = Descriptors::new(instance, adapter, device, queue);
+
         let egui_ctx = Context::default();
         // The rest of the desktop UI (menu bar offset, movie viewport, egui-wgpu
         // screen descriptor) assumes egui's pixels_per_point equals the window
@@ -132,24 +130,6 @@ impl GuiController {
         );
         egui_winit.set_max_texture_side(descriptors.limits.max_texture_dimension_2d as usize);
 
-        let movie_view_renderer = Arc::new(MovieViewRenderer::new(
-            &descriptors.device,
-            surface_format,
-            window.fullscreen().is_none() && !no_gui,
-            size.height,
-            window.scale_factor(),
-        ));
-        let egui_renderer = egui_wgpu::Renderer::new(
-            &descriptors.device,
-            surface_format,
-            egui_wgpu::RendererOptions {
-                msaa_samples: 1,
-                depth_stencil_format: None,
-                dithering: false,
-                predictable_texture_filtering: false,
-            },
-        );
-        let descriptors = Arc::new(descriptors);
         let gui = RuffleGui::new(
             Arc::downgrade(&window),
             event_loop,
@@ -570,38 +550,156 @@ impl GuiController {
     }
 }
 
-fn select_wgpu_backend(
-    preferred_backends: wgpu::Backends,
-    window: &Arc<Window>,
-) -> anyhow::Result<(wgpu::Instance, wgpu::Backends)> {
-    for backend in preferred_backends.iter() {
-        if let Some(instance) = try_wgpu_backend(backend, window.clone()) {
-            tracing::info!(
-                "Using preferred backend {}",
-                format_list(&get_backend_names(backend), "and")
-            );
-            return Ok((instance, backend));
-        }
-    }
+struct GpuStack {
+    descriptors: Descriptors,
+    surface: wgpu::Surface<'static>,
+    surface_format: wgpu::TextureFormat,
+    movie_view_renderer: Arc<MovieViewRenderer>,
+    egui_renderer: egui_wgpu::Renderer,
+}
 
-    tracing::warn!(
-        "Preferred backend(s) of {} not available; falling back to any",
-        format_list(&get_backend_names(preferred_backends), "or")
+fn backend_try_order(preferred_backends: wgpu::Backends) -> Vec<wgpu::Backends> {
+    let mut order: Vec<_> = preferred_backends.iter().collect();
+    for backend in wgpu::Backends::all() - preferred_backends {
+        order.push(backend);
+    }
+    order
+}
+
+fn try_create_gpu_stack(
+    backend: wgpu::Backends,
+    window: Arc<Window>,
+    power_preference: wgpu::PowerPreference,
+    no_gui: bool,
+) -> Result<GpuStack, String> {
+    let backend_name = format_list(&get_backend_names(backend), "and");
+    let Some(instance) = try_wgpu_backend(backend, window.clone()) else {
+        return Err(format!("no adapters for {backend_name}"));
+    };
+
+    tracing::info!("Trying graphics backend {backend_name}");
+
+    let surface = instance
+        .create_surface(window.clone())
+        .map_err(|e| format!("create_surface: {e}"))?;
+    let (adapter, device, queue) = futures::executor::block_on(request_adapter_and_device(
+        backend,
+        &instance,
+        Some(&surface),
+        power_preference,
+    ))
+    .map_err(|e| e.to_string())?;
+
+    let adapter_info = adapter.get_info();
+    tracing::info!(
+        "Using graphics API {} on {} (type: {:?})",
+        adapter_info.backend.to_str(),
+        adapter_info.name,
+        adapter_info.device_type
     );
 
-    for backend in wgpu::Backends::all() - preferred_backends {
-        if let Some(instance) = try_wgpu_backend(backend, window.clone()) {
-            tracing::info!(
-                "Using fallback backend {}",
-                format_list(&get_backend_names(backend), "and")
-            );
-            return Ok((instance, backend));
-        }
+    // Capture pipeline errors without panicking so we can fall back to another backend.
+    let captured_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    {
+        let captured_error = captured_error.clone();
+        device.on_uncaptured_error(Arc::new(move |error| {
+            if let Ok(mut slot) = captured_error.lock() {
+                *slot = Some(error.to_string());
+            }
+        }));
     }
 
-    Err(anyhow!(
-        "No compatible graphics backends of any kind were available"
-    ))
+    let preferred_formats = [
+        wgpu::TextureFormat::Rgba8Unorm,
+        wgpu::TextureFormat::Bgra8Unorm,
+    ];
+    let supported_formats = surface.get_capabilities(&adapter).formats;
+    let surface_format = preferred_formats
+        .iter()
+        .find(|format| supported_formats.contains(format))
+        .copied()
+        .or_else(|| supported_formats.first().copied())
+        .ok_or_else(|| "surface reported no texture formats".to_string())?;
+    tracing::info!("Using surface format {:?}", surface_format);
+
+    let size = window.inner_size();
+    surface.configure(
+        &device,
+        &wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: surface_format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
+            width: size.width.max(1),
+            height: size.height.max(1),
+            present_mode: Default::default(),
+            desired_maximum_frame_latency: 2,
+            alpha_mode: Default::default(),
+            view_formats: Default::default(),
+        },
+    );
+
+    if let Some(error) = take_captured_error(&captured_error) {
+        return Err(error);
+    }
+
+    let descriptors = Descriptors::new(instance, adapter, device, queue);
+    if let Some(error) = take_captured_error(&captured_error) {
+        return Err(error);
+    }
+
+    let movie_view_renderer = catch_unwind(AssertUnwindSafe(|| {
+        MovieViewRenderer::new(
+            &descriptors.device,
+            surface_format,
+            window.fullscreen().is_none() && !no_gui,
+            size.height,
+            window.scale_factor(),
+        )
+    }))
+    .map_err(|_| "MovieViewRenderer panicked".to_string())?;
+    if let Some(error) = take_captured_error(&captured_error) {
+        return Err(error);
+    }
+    let movie_view_renderer = Arc::new(movie_view_renderer);
+
+    let egui_renderer = catch_unwind(AssertUnwindSafe(|| {
+        egui_wgpu::Renderer::new(
+            &descriptors.device,
+            surface_format,
+            egui_wgpu::RendererOptions {
+                msaa_samples: 1,
+                depth_stencil_format: None,
+                dithering: false,
+                predictable_texture_filtering: false,
+            },
+        )
+    }))
+    .map_err(|_| "egui_wgpu::Renderer panicked".to_string())?;
+    if let Some(error) = take_captured_error(&captured_error) {
+        return Err(error);
+    }
+
+    tracing::info!("Initialized graphics backend {backend_name}");
+
+    // After a successful init, treat further GPU errors as fatal again.
+    descriptors.device.on_uncaptured_error(Arc::new(|error| {
+        panic!("wgpu error: {error}");
+    }));
+
+    Ok(GpuStack {
+        descriptors,
+        surface,
+        surface_format,
+        movie_view_renderer,
+        egui_renderer,
+    })
+}
+
+fn take_captured_error(captured_error: &Arc<Mutex<Option<String>>>) -> Option<String> {
+    captured_error
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take())
 }
 
 fn try_wgpu_backend(backend: wgpu::Backends, window: Arc<Window>) -> Option<wgpu::Instance> {
