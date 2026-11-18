@@ -322,7 +322,6 @@ impl UiBackend for DesktopUiBackend {
         let name = &query.name;
         let is_bold = query.is_bold;
         let is_italic = query.is_italic;
-        let lowercase_name = query.lowercase_name.as_str();
 
         let weight = if is_bold {
             fontdb::Weight::BOLD
@@ -335,31 +334,29 @@ impl UiBackend for DesktopUiBackend {
             fontdb::Style::Normal
         };
 
-        // fontdb's `query` is case-sensitive; resolve the canonical family name
-        // case-insensitively (first match) and re-query so fontdb still selects
-        // weight/style. Always resolving case-insensitively avoids order-dependent
-        // picks when case-duplicate fonts are installed.
-        let canonical = self.font_database.faces().find_map(|face| {
-            face.families
-                .iter()
-                .find(|(fam, _)| fam.to_lowercase() == lowercase_name)
-                .map(|(fam, _)| fam.clone())
-        });
-        let id = canonical.and_then(|canon| {
-            if canon.as_str() != name.as_str() {
-                tracing::info!("Device font \"{name}\" matched case-insensitively to \"{canon}\"");
+        // Try the requested name first, then well-known CJK aliases (e.g. Windows
+        // "宋体" → macOS "Songti SC"). Register under the original query name so
+        // later lookups still succeed.
+        let mut candidate_names = vec![name.as_str()];
+        candidate_names.extend(cjk_device_font_aliases(name));
+
+        let mut matched: Option<(String, fontdb::ID)> = None;
+        for candidate in candidate_names {
+            if let Some((canon, id)) =
+                resolve_fontdb_family(&self.font_database, candidate, weight, style)
+            {
+                if canon.as_str() != name.as_str() {
+                    tracing::info!(
+                        "Device font \"{name}\" matched to \"{canon}\" (via \"{candidate}\")"
+                    );
+                }
+                matched = Some((canon, id));
+                break;
             }
-            let query = fontdb::Query {
-                families: &[Family::Name(&canon)],
-                weight,
-                style,
-                ..Default::default()
-            };
-            self.font_database.query(&query)
-        });
+        }
 
         // It'd be nice if we can get the full list of candidates... Feature request?
-        if let Some(id) = id
+        if let Some((_canon, id)) = matched
             && let Some(face) = self.font_database.face(id)
         {
             tracing::info!(
@@ -385,13 +382,45 @@ impl UiBackend for DesktopUiBackend {
         query: &FontQuery,
         register: &mut dyn FnMut(FontDefinition),
     ) -> Vec<FontQuery> {
+        // Prefer a locally installed equivalent of Windows/Flash CJK names so
+        // fontconfig does not fall through to Latin-only faces (e.g. Verdana).
+        let sort_query = resolve_cjk_sort_query(query, &self.font_database);
+
         cfg_select! {
             all(unix, feature = "fontconfig") => {
-                fontconfig::sort_device_fonts(query, register, self.device_font_renderer, &self.font_atlases)
-                    .inspect_err(|err| tracing::error!("Cannot sort device fonts: {err}"))
-                    .unwrap_or_default()
+                let mut fonts = fontconfig::sort_device_fonts(
+                    &sort_query,
+                    register,
+                    self.device_font_renderer,
+                    &self.font_atlases,
+                )
+                .inspect_err(|err| tracing::error!("Cannot sort device fonts: {err}"))
+                .unwrap_or_default();
+
+                // Ensure CJK-capable faces are present for glyph fallback even when
+                // fontconfig's first matches lack East Asian coverage.
+                append_cjk_fontdb_fallbacks(
+                    query,
+                    &self.font_database,
+                    self.device_font_renderer,
+                    &self.font_atlases,
+                    register,
+                    &mut fonts,
+                );
+                fonts
             }
-            _ => Vec::new(),
+            _ => {
+                let mut fonts = Vec::new();
+                append_cjk_fontdb_fallbacks(
+                    query,
+                    &self.font_database,
+                    self.device_font_renderer,
+                    &self.font_atlases,
+                    register,
+                    &mut fonts,
+                );
+                fonts
+            }
         }
     }
 
@@ -534,6 +563,179 @@ fn load_fontdb_font(
                 data: FontFileData::new_shared(bin.clone()),
                 index: face.index,
             })
+        }
+    }
+}
+
+/// Flash/Windows CJK family names → platform fonts commonly installed elsewhere.
+fn cjk_device_font_aliases(name: &str) -> &'static [&'static str] {
+    match name {
+        // Song / Ming
+        "宋体" | "SimSun" | "NSimSun" | "新宋体" => &[
+            "Songti SC",
+            "STSong",
+            "Noto Serif CJK SC",
+            "Source Han Serif SC",
+        ],
+        "宋体-简" | "宋體-簡" => &["Songti SC", "STSong"],
+        "宋体-繁" | "宋體-繁" => &["Songti TC", "STSong"],
+        // Hei / Gothic
+        "黑体" | "SimHei" => &[
+            "Heiti SC",
+            "STHeiti",
+            "PingFang SC",
+            "Hiragino Sans GB",
+            "Microsoft YaHei",
+            "Noto Sans CJK SC",
+            "Source Han Sans SC",
+        ],
+        "微软雅黑" | "Microsoft YaHei" => &[
+            "PingFang SC",
+            "Heiti SC",
+            "Microsoft YaHei UI",
+            "Noto Sans CJK SC",
+            "Source Han Sans SC",
+        ],
+        // Kai
+        "楷体" | "楷体_GB2312" | "KaiTi" | "STKaiti" => &[
+            "Kaiti SC",
+            "STKaiti",
+            "KaiTi",
+            "Noto Serif CJK SC",
+        ],
+        // Fangsong
+        "仿宋" | "仿宋_GB2312" | "FangSong" => &["STFangsong", "FangSong", "Songti SC"],
+        // YouYuan / LiSu / STXihei — approximate with available gothic/serif faces
+        "幼圆" | "YouYuan" => &["PingFang SC", "Heiti SC", "Hiragino Sans GB", "Microsoft YaHei"],
+        "隶书" | "LiSu" => &["STXingkai", "Kaiti SC", "STKaiti", "Songti SC"],
+        "华文细黑" | "STXihei" => &["STHeiti", "Heiti SC", "PingFang SC", "Hiragino Sans GB"],
+        "华文黑体" => &["STHeiti", "Heiti SC", "PingFang SC"],
+        "华文楷体" | "华文宋体" | "华文仿宋" => &["STKaiti", "Kaiti SC", "Songti SC", "STSong"],
+        _ => &[],
+    }
+}
+
+fn cjk_glyph_fallback_families() -> &'static [&'static str] {
+    &[
+        "PingFang SC",
+        "Heiti SC",
+        "STHeiti",
+        "Hiragino Sans GB",
+        "Songti SC",
+        "STSong",
+        "Microsoft YaHei",
+        "Microsoft JhengHei",
+        "Noto Sans CJK SC",
+        "Noto Sans CJK TC",
+        "Source Han Sans SC",
+        "WenQuanYi Zen Hei",
+        "Arial Unicode MS",
+    ]
+}
+
+/// Case-insensitive family resolve + weight/style query (fontdb is case-sensitive).
+fn resolve_fontdb_family(
+    font_database: &fontdb::Database,
+    name: &str,
+    weight: fontdb::Weight,
+    style: fontdb::Style,
+) -> Option<(String, fontdb::ID)> {
+    let lowercase_name = name.to_lowercase();
+    let canonical = font_database.faces().find_map(|face| {
+        face.families
+            .iter()
+            .find(|(fam, _)| fam.to_lowercase() == lowercase_name)
+            .map(|(fam, _)| fam.clone())
+    })?;
+    let id = font_database.query(&fontdb::Query {
+        families: &[Family::Name(&canonical)],
+        weight,
+        style,
+        ..Default::default()
+    })?;
+    Some((canonical, id))
+}
+
+fn resolve_cjk_sort_query(query: &FontQuery, font_database: &fontdb::Database) -> FontQuery {
+    let weight = if query.is_bold {
+        fontdb::Weight::BOLD
+    } else {
+        fontdb::Weight::NORMAL
+    };
+    let style = if query.is_italic {
+        fontdb::Style::Italic
+    } else {
+        fontdb::Style::Normal
+    };
+
+    if resolve_fontdb_family(font_database, &query.name, weight, style).is_some() {
+        return query.clone();
+    }
+
+    for alias in cjk_device_font_aliases(&query.name) {
+        if let Some((canon, _)) = resolve_fontdb_family(font_database, alias, weight, style) {
+            tracing::info!(
+                "Sorting device fonts for \"{}\" using installed alias \"{canon}\"",
+                query.name
+            );
+            return FontQuery::new(query.font_type, canon, query.is_bold, query.is_italic);
+        }
+    }
+
+    query.clone()
+}
+
+fn append_cjk_fontdb_fallbacks(
+    query: &FontQuery,
+    font_database: &fontdb::Database,
+    device_font_renderer: DeviceFontRenderer,
+    atlases: &FontAtlases,
+    register: &mut dyn FnMut(FontDefinition),
+    fonts: &mut Vec<FontQuery>,
+) {
+    let weight = if query.is_bold {
+        fontdb::Weight::BOLD
+    } else {
+        fontdb::Weight::NORMAL
+    };
+    let style = if query.is_italic {
+        fontdb::Style::Italic
+    } else {
+        fontdb::Style::Normal
+    };
+
+    for family in cjk_glyph_fallback_families() {
+        let Some((canon, id)) = resolve_fontdb_family(font_database, family, weight, style) else {
+            continue;
+        };
+
+        // Skip duplicates already provided by fontconfig / earlier aliases.
+        if fonts
+            .iter()
+            .any(|existing| existing.lowercase_name == canon.to_lowercase())
+        {
+            continue;
+        }
+
+        let Some(face) = font_database.face(id) else {
+            continue;
+        };
+        let is_bold = face.weight > fontdb::Weight::NORMAL;
+        let is_italic = face.style != fontdb::Style::Normal;
+
+        match load_fontdb_font(canon.clone(), face, device_font_renderer, atlases) {
+            Ok(definition) => {
+                register(definition);
+                fonts.push(FontQuery::new(
+                    query.font_type,
+                    canon,
+                    is_bold,
+                    is_italic,
+                ));
+            }
+            Err(error) => {
+                tracing::error!("Error loading CJK fallback font \"{family}\": {error}");
+            }
         }
     }
 }

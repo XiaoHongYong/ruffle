@@ -473,23 +473,25 @@ impl<'gc> Library<'gc> {
         }
 
         let mut result = vec![];
-        // First try to find any exactly matching fonts.
-        for name in self.default_font_names.entry(name).or_default().clone() {
-            let query = FontQuery::new(FontType::Device, name, is_bold, is_italic);
+        let names = self.default_font_names.entry(name).or_default().clone();
+
+        // Load every configured font that exists. The first match is the primary
+        // face; later entries are used as glyph fallbacks (needed for CJK text on
+        // `_sans` / `_serif` / etc., which otherwise only resolve to Latin fonts).
+        for font_name in &names {
+            let query = FontQuery::new(FontType::Device, font_name.clone(), is_bold, is_italic);
             if let Some(font) = self.get_or_load_exact_device_font(&query, ui, renderer, gc_context)
             {
                 result.push(font);
-                break; // TODO: Return multiple fonts when it's needed.
             }
         }
 
-        // Nothing found, try a compatible font.
+        // Nothing found exactly — try compatible fonts already registered.
         if result.is_empty() {
-            for name in self.default_font_names.entry(name).or_default().clone() {
-                let query = FontQuery::new(FontType::Device, name, is_bold, is_italic);
+            for font_name in &names {
+                let query = FontQuery::new(FontType::Device, font_name.clone(), is_bold, is_italic);
                 if let Some(font) = self.device_fonts.find(&query) {
                     result.push(font);
-                    break; // TODO: Return multiple fonts when it's needed.
                 }
             }
         }

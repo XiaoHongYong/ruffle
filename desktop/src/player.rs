@@ -378,6 +378,13 @@ impl ActivePlayer {
                     "Tinos".into(),
                     "Liberation Serif".into(),
                     "DejaVu Serif".into(),
+                    // CJK glyph fallbacks (Flash `_serif` / device text)
+                    "Songti SC".into(),           // macOS
+                    "STSong".into(),              // macOS
+                    "Noto Serif CJK SC".into(),   // Linux
+                    "Source Han Serif SC".into(), // Linux
+                    "SimSun".into(),              // Windows
+                    "Arial Unicode MS".into(),    // macOS
                 ],
             );
             player_lock.set_default_font(
@@ -387,6 +394,16 @@ impl ActivePlayer {
                     "Arimo".into(),
                     "Liberation Sans".into(),
                     "DejaVu Sans".into(),
+                    // CJK glyph fallbacks (Flash `_sans` MenuBar / device text)
+                    "PingFang SC".into(),        // macOS
+                    "Heiti SC".into(),           // macOS
+                    "STHeiti".into(),            // macOS
+                    "Hiragino Sans GB".into(),   // macOS
+                    "Microsoft YaHei".into(),    // Windows
+                    "Noto Sans CJK SC".into(),   // Linux
+                    "Source Han Sans SC".into(), // Linux
+                    "WenQuanYi Zen Hei".into(),  // Linux
+                    "Arial Unicode MS".into(),   // macOS
                 ],
             );
             player_lock.set_default_font(
@@ -396,6 +413,12 @@ impl ActivePlayer {
                     "Cousine".into(),
                     "Liberation Mono".into(),
                     "DejaVu Sans Mono".into(),
+                    // CJK glyph fallbacks
+                    "Heiti SC".into(),
+                    "STHeiti".into(),
+                    "Noto Sans Mono CJK SC".into(),
+                    "Microsoft YaHei".into(),
+                    "Arial Unicode MS".into(),
                 ],
             );
             player_lock.set_default_font(
@@ -404,6 +427,8 @@ impl ActivePlayer {
                     "ヒラギノ角ゴ Pro W3".into(), // Mac with Japanese environment
                     "MS UI Gothic".into(),        // Windows
                     "Noto Sans CJK JP".into(),    // Linux
+                    "Hiragino Sans GB".into(),    // macOS Chinese-capable gothic
+                    "Heiti SC".into(),            // macOS
                     "Arial Unicode MS".into(),    // Mac fallback
                 ],
             );
@@ -413,6 +438,7 @@ impl ActivePlayer {
                     "Osaka－等幅".into(),      // Mac with Japanese environment
                     "MS Gothic".into(),        // Windows
                     "Noto Sans CJK JP".into(), // Linux
+                    "Heiti SC".into(),         // macOS
                     "Arial Unicode MS".into(), // Mac fallback
                 ],
             );
@@ -422,6 +448,8 @@ impl ActivePlayer {
                     "ヒラギノ明朝 Pro W3".into(), // Mac with Japanese environment
                     "MS PMincho".into(),          // Windows
                     "Noto Sans CJK JP".into(),    // Linux
+                    "Songti SC".into(),           // macOS
+                    "STSong".into(),              // macOS
                     "Arial Unicode MS".into(),    // Mac fallback
                 ],
             );
