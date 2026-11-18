@@ -1,18 +1,12 @@
-use super::{LocalizableText, text};
-use crate::custom_event::RuffleEvent;
-use crate::gui::DialogDescriptor;
-use crate::gui::dialogs::select_path_dialog::{
-    SelectPathDialogConfiguration, SelectPathDialogResult,
-};
+use super::text;
 use crate::preferences::GlobalPreferences;
 use rfd::AsyncFileDialog;
-use ruffle_frontend_utils::bundle::Bundle;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
-use tokio::sync::oneshot;
-use walkdir::{DirEntry, WalkDir};
 use winit::{event_loop::EventLoopProxy, window::Window};
+
+use crate::custom_event::RuffleEvent;
 
 #[derive(Clone)]
 pub struct FilePicker {
@@ -40,6 +34,14 @@ impl FilePicker {
                 preferences,
             }),
         }
+    }
+
+    pub fn event_loop(&self) -> &EventLoopProxy<RuffleEvent> {
+        &self.data.event_loop
+    }
+
+    pub fn parent_window(&self) -> Weak<Window> {
+        self.data.parent.clone()
     }
 
     pub fn show_dialog<F, O>(&self, mut dialog: AsyncFileDialog, f: F) -> Option<O>
@@ -93,77 +95,5 @@ impl FilePicker {
         }
 
         Some(self.show_dialog(dialog, |d| d.pick_folder())?.await?.into())
-    }
-
-    /// Pick a directory and content to play.
-    ///
-    /// This can return:
-    ///  * a Ruffle bundle as a directory (`/dir/bundle_dir`, `/dir/bundle_dir`),
-    ///  * a multi-asset SWF movie (`/dir/root_dir`, `/dir/root_dir/root_movie.swf`).
-    pub async fn pick_ruffle_directory_and_content(
-        &self,
-        dir: Option<PathBuf>,
-    ) -> Option<(PathBuf, PathBuf)> {
-        let directory = self.pick_ruffle_directory(dir).await?;
-
-        // Try opening a bundle...
-        match Bundle::from_path(&directory) {
-            Ok(_) => {
-                // It's a bundle.
-                return Some((directory.clone(), directory));
-            }
-            Err(err) => {
-                tracing::info!("The opened directory is not a bundle: {err}");
-            }
-        }
-
-        // If there's only one SWF in the directory, treat is as the root...
-        let mut files: Vec<DirEntry> = WalkDir::new(&directory)
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter(|e| e.file_type().is_file())
-            .filter(|e| e.file_name().as_encoded_bytes().ends_with(b".swf"))
-            .take(2)
-            .collect();
-        if files.len() == 1 {
-            let file = files.remove(0);
-            tracing::info!(
-                "There's only one .swf file in the directory, treating it as the root: {}",
-                file.path().to_string_lossy()
-            );
-            return Some((directory, file.path().to_path_buf()));
-        }
-
-        // If there are multiple SWFs, show a dialog for picking one...
-        let (notifier, receiver) = oneshot::channel();
-        let _ =
-            self.data
-                .event_loop
-                .send_event(RuffleEvent::OpenDialog(DialogDescriptor::SelectPath(
-                    SelectPathDialogConfiguration::new(
-                        notifier,
-                        directory.clone(),
-                        LocalizableText::LocalizedText("file-picker-select-root-movie-title"),
-                        Some(LocalizableText::LocalizedText(
-                            "file-picker-select-root-movie-message",
-                        )),
-                        LocalizableText::LocalizedText("file-picker-select-root-movie-select"),
-                        Some("swf"),
-                    ),
-                )));
-        let SelectPathDialogResult::PathSelected(root_movie) = receiver.await.ok()? else {
-            return None;
-        };
-
-        if !root_movie.starts_with(&directory) {
-            tracing::error!(
-                "Selected a file outside of the directory: {}, {}",
-                root_movie.to_string_lossy(),
-                directory.to_string_lossy()
-            );
-            return None;
-        }
-
-        Some((directory, root_movie))
     }
 }

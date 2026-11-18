@@ -1,11 +1,13 @@
+use crate::custom_event::{FolderBrowserSelection, RuffleEvent};
 use crate::gui::{FilePicker, LocalizableText, text};
 use egui::{TextEdit, Ui};
 use ruffle_common::url_ext::UrlExt;
 use ruffle_frontend_utils::content::ContentDescriptor;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use unic_langid::LanguageIdentifier;
 use url::Url;
+use winit::window::Window;
 
 #[derive(Default)]
 struct PathOrUrlFieldValue {
@@ -63,6 +65,25 @@ impl PathOrUrlFieldValue {
     }
 }
 
+/// Shared handle used by the folder browser to fill this field without owning the widget.
+#[derive(Clone)]
+pub struct PathOrUrlFieldHandle {
+    value: Arc<Mutex<PathOrUrlFieldValue>>,
+    parent: Weak<Window>,
+}
+
+impl PathOrUrlFieldHandle {
+    pub fn set_from_directory_selection(&self, directory: PathBuf, content: PathBuf) {
+        *self
+            .value
+            .lock()
+            .expect("Non-poisoned value") = PathOrUrlFieldValue::from_picked_directory(directory, content);
+        if let Some(window) = self.parent.upgrade() {
+            window.request_redraw();
+        }
+    }
+}
+
 pub struct PathOrUrlField {
     picker: FilePicker,
     value: Arc<Mutex<PathOrUrlFieldValue>>,
@@ -83,6 +104,13 @@ impl PathOrUrlField {
                     .unwrap_or_default(),
             )),
             hint,
+        }
+    }
+
+    pub fn handle(&self) -> PathOrUrlFieldHandle {
+        PathOrUrlFieldHandle {
+            value: self.value.clone(),
+            parent: self.picker.parent_window(),
         }
     }
 
@@ -107,14 +135,14 @@ impl PathOrUrlField {
                 .clicked()
             {
                 let dir = dir.clone();
-                let value = self.value.clone();
+                let handle = self.handle();
                 let picker = self.picker.clone();
                 tokio::spawn(async move {
-                    if let Some((directory, content)) =
-                        picker.pick_ruffle_directory_and_content(dir).await
-                    {
-                        *Self::lock_value(&value) =
-                            PathOrUrlFieldValue::from_picked_directory(directory, content);
+                    if let Some(directory) = picker.pick_ruffle_directory(dir).await {
+                        let _ = picker.event_loop().send_event(RuffleEvent::ShowFolderBrowser(
+                            directory,
+                            FolderBrowserSelection::FillField(handle),
+                        ));
                     }
                 });
             }

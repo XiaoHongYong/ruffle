@@ -1,6 +1,7 @@
 mod context_menu;
 mod controller;
 pub mod dialogs;
+mod folder_browser;
 mod locale;
 mod menu_bar;
 mod movie;
@@ -9,8 +10,11 @@ mod theme;
 mod widgets;
 
 pub use controller::GuiController;
+pub(crate) use controller::load_system_fonts;
 pub use dialogs::DialogDescriptor;
+pub use folder_browser::FolderBrowserWindow;
 pub use locale::LocalizableText;
+pub use widgets::path_or_url_field::PathOrUrlFieldHandle;
 pub use locale::available_languages;
 pub use locale::optional_text;
 pub use locale::text;

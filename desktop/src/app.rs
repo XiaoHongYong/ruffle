@@ -1,10 +1,10 @@
-use crate::custom_event::{OpenType, RuffleEvent};
-use crate::gui::{GuiController, MENU_HEIGHT};
+use crate::custom_event::{FolderBrowserSelection, OpenType, RuffleEvent};
+use crate::gui::{FolderBrowserWindow, GuiController, MENU_HEIGHT, load_system_fonts};
 use crate::player::{LaunchOptions, PlayerController};
 use crate::preferences::GlobalPreferences;
 use crate::util::{
-    get_screen_size, gilrs_button_to_gamepad_button, winit_input_to_ruffle_key_descriptor,
-    winit_to_ruffle_text_control,
+    get_screen_size, gilrs_button_to_gamepad_button, parse_url,
+    winit_input_to_ruffle_key_descriptor, winit_to_ruffle_text_control,
 };
 use anyhow::Error;
 use gilrs::{Event, EventType, Gilrs};
@@ -14,6 +14,7 @@ use ruffle_core::events::{ImeEvent, ImeNotification, PlayerNotification};
 use ruffle_core::swf::HeaderExt;
 use ruffle_frontend_utils::content::ContentDescriptor;
 use ruffle_render::backend::ViewportDimensions;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use winit::application::ApplicationHandler;
@@ -27,6 +28,8 @@ struct MainWindow {
     preferences: GlobalPreferences,
     gui: GuiController,
     player: PlayerController,
+    folder_browser: Option<FolderBrowserWindow>,
+    font_database: fontdb::Database,
     minimized: bool,
     /// Set from `WindowEvent::Occluded`, which winit only reports on macOS and X11
     /// (and on X11 only without a compositor). Always false elsewhere.
@@ -52,6 +55,56 @@ struct MainWindow {
 }
 
 impl MainWindow {
+    pub fn open_folder_browser(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        directory: PathBuf,
+        selection: FolderBrowserSelection,
+    ) {
+        let fonts = load_system_fonts(&self.font_database, self.preferences.language());
+        match FolderBrowserWindow::create(
+            event_loop,
+            self.gui.descriptors().clone(),
+            directory,
+            selection,
+            self.event_loop_proxy.clone(),
+            self.preferences.clone(),
+            fonts,
+        ) {
+            Ok(browser) => {
+                self.folder_browser = Some(browser);
+            }
+            Err(err) => {
+                tracing::error!("Failed to open folder browser window: {err}");
+            }
+        }
+    }
+
+    /// Handle events aimed at the folder browser. Returns `true` if the event
+    /// belonged to that window (and should not be forwarded to the main window).
+    pub fn handle_folder_browser_event(&mut self, window_id: WindowId, event: &WindowEvent) -> bool {
+        let Some(browser) = self.folder_browser.as_mut() else {
+            return false;
+        };
+        if browser.window_id() != window_id {
+            return false;
+        }
+
+        if matches!(event, WindowEvent::RedrawRequested) {
+            browser.render();
+            if browser.should_close() {
+                self.folder_browser = None;
+            }
+            return true;
+        }
+
+        let should_close = browser.handle_event(event);
+        if should_close {
+            self.folder_browser = None;
+        }
+        true
+    }
+
     pub fn window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
         if matches!(event, WindowEvent::RedrawRequested) {
             // Don't render when nobody can see the result: while minimized, the
@@ -66,12 +119,41 @@ impl MainWindow {
             return;
         }
 
+        // Handle file drops before egui so opening never depends on whether a
+        // widget considered the event consumed.
+        if let WindowEvent::DroppedFile(file) = &event {
+            let content_descriptor = parse_url(file)
+                .ok()
+                .map(|url| ContentDescriptor {
+                    url,
+                    root_content_path: None,
+                })
+                .or_else(|| ContentDescriptor::new_local(file, None));
+            if let Some(content_descriptor) = content_descriptor {
+                self.gui.create_movie(
+                    &mut self.player,
+                    LaunchOptions::from(&self.preferences),
+                    content_descriptor,
+                );
+            } else {
+                tracing::warn!(
+                    "Ignored dropped file (could not convert path to URL): {}",
+                    file.display()
+                );
+            }
+            // Let egui clear its hover/drop bookkeeping, but don't treat the
+            // drop as "consumed away" from the player.
+            let _ = self.gui.handle_event(&event);
+            return;
+        }
+
         if self.gui.handle_event(&event) {
             // Event consumed by GUI.
             return;
         }
         match event {
             WindowEvent::CloseRequested => {
+                self.folder_browser = None;
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
@@ -121,15 +203,6 @@ impl MainWindow {
                 // Player does not queue mouse moves and instead skips them
                 // if they happen when the movie is busy.
                 self.mouse_move_pending = true;
-            }
-            WindowEvent::DroppedFile(file) => {
-                if let Some(content_descriptor) = ContentDescriptor::new_local(&file, None) {
-                    self.gui.create_movie(
-                        &mut self.player,
-                        LaunchOptions::from(&self.preferences),
-                        content_descriptor,
-                    );
-                }
             }
             WindowEvent::Focused(true) => {
                 self.handle_player_event(PlayerEvent::FocusGained);
@@ -432,6 +505,9 @@ impl MainWindow {
         if player_needs_render || self.gui.needs_render() {
             self.gui.window().request_redraw();
         }
+        if let Some(browser) = &self.folder_browser {
+            browser.request_redraw_if_needed();
+        }
     }
 }
 
@@ -457,7 +533,15 @@ macro_rules! enter_runtime {
 
 impl App {
     pub fn new(preferences: GlobalPreferences) -> Result<(Self, EventLoop<RuffleEvent>), Error> {
-        let event_loop = EventLoop::with_user_event().build()?;
+        let mut event_loop_builder = EventLoop::with_user_event();
+
+        #[cfg(windows)]
+        {
+            use winit::platform::windows::EventLoopBuilderExtWindows;
+            event_loop_builder.with_msg_hook(crate::windows::handle_drop_message);
+        }
+
+        let event_loop = event_loop_builder.build()?;
 
         let mut font_database = fontdb::Database::default();
         font_database.load_system_fonts();
@@ -469,6 +553,9 @@ impl App {
             .ok();
         let event_loop_proxy = event_loop.create_proxy();
         let runtime = tokio::runtime::Runtime::new()?;
+
+        #[cfg(windows)]
+        crate::windows::set_drop_proxy(event_loop_proxy.clone());
 
         #[cfg(target_os = "macos")]
         crate::macos::install_open_urls_handler(event_loop_proxy.clone(), preferences.clone());
@@ -537,6 +624,11 @@ impl ApplicationHandler<RuffleEvent> for App {
                 .expect("Window should be created");
             let max_window_size = get_screen_size(&window);
             window.set_max_inner_size(Some(max_window_size));
+
+            // Replace winit OLE drag-drop with WM_DROPFILES (more reliable on Win7).
+            #[cfg(windows)]
+            crate::windows::enable_file_drops(&window);
+
             let window = Arc::new(window);
             let font_database = self.font_database.clone();
 
@@ -554,7 +646,7 @@ impl ApplicationHandler<RuffleEvent> for App {
                 event_loop_proxy.clone(),
                 window.clone(),
                 gui.descriptors().clone(),
-                font_database,
+                font_database.clone(),
                 preferences.clone(),
                 gui.file_picker(),
             );
@@ -585,9 +677,11 @@ impl ApplicationHandler<RuffleEvent> for App {
 
             let mut loaded = LoadingState::Loading;
 
+            // Always show the window once the GUI exists. Waiting for SWF
+            // metadata kept the window invisible on load failures (common on
+            // Windows when filesystem permission prompts can't be answered).
+            window.set_visible(true);
             if movie_url.is_none() && !opened_from_os {
-                // No SWF provided on command line; show window with dummy movie immediately.
-                window.set_visible(true);
                 loaded = LoadingState::Loaded;
             }
 
@@ -595,6 +689,8 @@ impl ApplicationHandler<RuffleEvent> for App {
                 preferences,
                 gui,
                 player,
+                folder_browser: None,
+                font_database,
                 min_window_size,
                 max_window_size,
                 no_gui,
@@ -636,28 +732,57 @@ impl ApplicationHandler<RuffleEvent> for App {
                 let event_loop = main_window.event_loop_proxy.clone();
                 let picker = main_window.gui.file_picker();
                 tokio::spawn(async move {
-                    let picked = match open_type {
+                    match open_type {
                         OpenType::File => {
-                            picker.pick_ruffle_file(None).await.map(|file| (file, None))
+                            if let Some(file) = picker.pick_ruffle_file(None).await
+                                && let Some(desc) = ContentDescriptor::new_local(&file, None)
+                            {
+                                let _ = event_loop.send_event(RuffleEvent::Open(desc, options));
+                            }
                         }
-                        OpenType::Directory => picker
-                            .pick_ruffle_directory_and_content(None)
-                            .await
-                            .map(|(dir, file)| (file, Some(dir))),
-                    };
-
-                    if let Some(desc) =
-                        picked.and_then(|(file, dir)| ContentDescriptor::new_local(&file, dir))
-                    {
-                        let _ = event_loop.send_event(RuffleEvent::Open(desc, options));
+                        OpenType::Directory => {
+                            if let Some(directory) = picker.pick_ruffle_directory(None).await {
+                                let _ = event_loop.send_event(RuffleEvent::ShowFolderBrowser(
+                                    directory,
+                                    FolderBrowserSelection::Open(options),
+                                ));
+                            }
+                        }
                     }
                 });
+            }
+
+            (Some(main_window), RuffleEvent::ShowFolderBrowser(directory, selection)) => {
+                main_window.open_folder_browser(event_loop, directory, selection);
             }
 
             (Some(main_window), RuffleEvent::Open(desc, options)) => {
                 main_window
                     .gui
                     .create_movie(&mut main_window.player, *options, desc);
+            }
+
+            (Some(main_window), RuffleEvent::OpenDroppedFile(file)) => {
+                let content_descriptor = parse_url(&file)
+                    .ok()
+                    .map(|url| ContentDescriptor {
+                        url,
+                        root_content_path: None,
+                    })
+                    .or_else(|| ContentDescriptor::new_local(&file, None));
+                if let Some(content_descriptor) = content_descriptor {
+                    let options = LaunchOptions::from(&main_window.preferences);
+                    main_window.gui.create_movie(
+                        &mut main_window.player,
+                        options,
+                        content_descriptor,
+                    );
+                } else {
+                    tracing::warn!(
+                        "Ignored dropped file (could not convert path to URL): {}",
+                        file.display()
+                    );
+                }
             }
 
             #[cfg(target_os = "macos")]
@@ -732,13 +857,26 @@ impl ApplicationHandler<RuffleEvent> for App {
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
+        window_id: WindowId,
         event: WindowEvent,
     ) {
         enter_runtime!(self);
 
         if let Some(main_window) = &mut self.main_window {
-            main_window.window_event(event_loop, event);
+            if main_window.handle_folder_browser_event(window_id, &event) {
+                return;
+            }
+            // File drops may report a different window_id (child HWND / OLE
+            // quirks); always route them to the main window.
+            let is_drop = matches!(
+                event,
+                WindowEvent::DroppedFile(_)
+                    | WindowEvent::HoveredFile(_)
+                    | WindowEvent::HoveredFileCancelled
+            );
+            if is_drop || main_window.gui.window().id() == window_id {
+                main_window.window_event(event_loop, event);
+            }
         }
     }
 

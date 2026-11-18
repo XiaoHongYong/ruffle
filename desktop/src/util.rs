@@ -4,7 +4,7 @@ use ruffle_core::events::{
     GamepadButton, KeyDescriptor, KeyLocation, LogicalKey, NamedKey as RuffleNamedKey, PhysicalKey,
     TextControlCode,
 };
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use url::Url;
 use winit::dpi::PhysicalSize;
 use winit::event::{KeyEvent, Modifiers};
@@ -380,12 +380,47 @@ pub fn get_screen_size(window: &Window) -> PhysicalSize<u32> {
     (width, height).into()
 }
 
+/// Strip Windows extended-length/`\\?\` prefixes so paths compare and convert
+/// cleanly via `Url::from_file_path` / `Path::starts_with`.
+pub fn simplify_path(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let raw = path.to_string_lossy();
+        if let Some(rest) = raw.strip_prefix(r"\\?\") {
+            if let Some(unc) = rest.strip_prefix("UNC\\").or_else(|| rest.strip_prefix("UNC/")) {
+                return PathBuf::from(format!(r"\\{unc}"));
+            }
+            return PathBuf::from(rest);
+        }
+    }
+    path.to_path_buf()
+}
+
+/// Make `path` absolute when possible, then strip Windows verbatim prefixes.
+pub fn absolute_path(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let canonical = absolute.canonicalize().unwrap_or(absolute);
+    simplify_path(&canonical)
+}
+
 pub fn parse_url(path: &Path) -> Result<Url, Error> {
     if path.exists() {
-        let absolute_path = path.canonicalize().unwrap_or_else(|_| path.to_owned());
+        let absolute_path = absolute_path(path);
         Url::from_file_path(absolute_path)
             .map_err(|_| anyhow!("Path must be absolute and cannot be a URL"))
     } else {
+        // Relative paths that don't exist yet (or aren't files) may still be URLs.
+        if path.is_absolute() {
+            if let Ok(url) = Url::from_file_path(simplify_path(path)) {
+                return Ok(url);
+            }
+        }
         Url::parse(path.to_str().unwrap_or_default())
             .ok()
             .filter(|url| url.host().is_some() || url.scheme() == "file")

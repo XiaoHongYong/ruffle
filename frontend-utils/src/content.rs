@@ -1,6 +1,35 @@
 use crate::bundle::Bundle;
 use std::fmt::{Debug, Formatter};
+use std::path::{Path, PathBuf};
 use url::Url;
+
+#[cfg(feature = "fs")]
+fn simplify_windows_path(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let raw = path.to_string_lossy();
+        if let Some(rest) = raw.strip_prefix(r"\\?\") {
+            if let Some(unc) = rest.strip_prefix("UNC\\").or_else(|| rest.strip_prefix("UNC/")) {
+                return PathBuf::from(format!(r"\\{unc}"));
+            }
+            return PathBuf::from(rest);
+        }
+    }
+    path.to_path_buf()
+}
+
+#[cfg(feature = "fs")]
+fn absolutize_local_path(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let canonical = absolute.canonicalize().unwrap_or(absolute);
+    simplify_windows_path(&canonical)
+}
 
 /// Describes the content to load.
 ///
@@ -31,8 +60,13 @@ impl ContentDescriptor {
         file: &std::path::Path,
         root_content_path: Option<std::path::PathBuf>,
     ) -> Option<Self> {
+        // `Url::from_file_path` requires an absolute path. Drag-drop / file
+        // pickers usually give one, but absolutize defensively and strip
+        // Windows `\\?\` prefixes that break some downstream comparisons.
+        let file = absolutize_local_path(file);
+        let root_content_path = root_content_path.map(|p| absolutize_local_path(&p));
         Some(Self {
-            url: Url::from_file_path(file).ok()?,
+            url: Url::from_file_path(&file).ok()?,
             root_content_path,
         })
     }

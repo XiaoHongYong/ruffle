@@ -153,6 +153,10 @@ fn main() -> Result<(), Error> {
     #[cfg(windows)]
     let _console = windows::Console::attach();
 
+    // Must run before winit / cpal / wgpu touch COM so drag-drop stays STA.
+    #[cfg(windows)]
+    windows::init_com_apartment();
+
     let opt = Opt::parse();
 
     #[cfg(feature = "shell-completions")]

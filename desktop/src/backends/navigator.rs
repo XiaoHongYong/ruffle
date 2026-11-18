@@ -34,6 +34,7 @@ impl PathAllowList {
         let mut allowed_path_prefixes = Vec::new();
 
         if let Some(movie_path) = content_descriptor.url.to_local_file_path() {
+            let movie_path = crate::util::simplify_path(&movie_path);
             if let Some(parent) = movie_path.parent() {
                 // TODO Remove it after integrating recents & bookmarks with
                 //   opening a directory.
@@ -43,7 +44,7 @@ impl PathAllowList {
         }
 
         if let Some(root_content_path) = &content_descriptor.root_content_path {
-            allowed_path_prefixes.push(root_content_path.clone());
+            allowed_path_prefixes.push(crate::util::simplify_path(root_content_path));
         }
 
         Self {
@@ -53,6 +54,11 @@ impl PathAllowList {
 
     /// Checks whether the user already allowed access to the file.
     pub fn is_path_allowed(&self, path: &Path) -> bool {
+        let Ok(path) = path.canonicalize() else {
+            return false;
+        };
+        // Compare without Windows `\\?\` prefixes so Disk vs VerbatimDisk match.
+        let path = crate::util::simplify_path(&path);
         for path_prefix in self
             .allowed_path_prefixes
             .lock()
@@ -62,10 +68,8 @@ impl PathAllowList {
             let Ok(path_prefix) = path_prefix.canonicalize() else {
                 continue;
             };
-            let Ok(path) = path.canonicalize() else {
-                continue;
-            };
-            if path.starts_with(path_prefix) {
+            let path_prefix = crate::util::simplify_path(&path_prefix);
+            if path.starts_with(&path_prefix) {
                 return true;
             }
         }
@@ -146,15 +150,20 @@ impl NavigatorInterface for DesktopNavigatorInterface {
     }
 
     async fn open_file(&self, path: &Path) -> io::Result<File> {
-        let path = &path.canonicalize()?;
+        let canonical = path.canonicalize()?;
+        // Keep a simplified path for allow-list prompts / comparisons, but open
+        // via the canonical path so long-path / symlink cases still work.
+        let simplified = crate::util::simplify_path(&canonical);
 
-        let allow = if self.allow_list.is_path_allowed(path) {
+        let allow = if self.allow_list.is_path_allowed(&simplified)
+            || self.allow_list.is_path_allowed(&canonical)
+        {
             true
         } else {
             match self.filesystem_access_mode {
                 FilesystemAccessMode::Allow => true,
                 FilesystemAccessMode::Deny => false,
-                FilesystemAccessMode::Ask => self.ask_for_filesystem_access(path).await,
+                FilesystemAccessMode::Ask => self.ask_for_filesystem_access(&simplified).await,
             }
         };
 
@@ -162,7 +171,8 @@ impl NavigatorInterface for DesktopNavigatorInterface {
             return Err(ErrorKind::PermissionDenied.into());
         }
 
-        File::open(path).or_else(|e| {
+        File::open(&canonical).or_else(|e| {
+            let path = &canonical;
             if cfg!(feature = "sandbox") {
                 use rfd::FileDialog;
                 let parent_path = path.parent().unwrap_or(path);

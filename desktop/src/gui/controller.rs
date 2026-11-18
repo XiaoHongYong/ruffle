@@ -258,11 +258,13 @@ impl GuiController {
         tracing::info!("Opening {}", content_descriptor.describe());
 
         self.close_movie(player);
+        // wgpu rejects 0×0 textures; keep a 1×1 fallback while the window is
+        // still settling (common right after a drag-drop open on Win7).
         let movie_view = MovieView::new(
             self.movie_view_renderer.clone(),
             &self.descriptors.device,
-            self.size.width,
-            self.size.height,
+            self.size.width.max(1),
+            self.size.height.max(1),
             #[cfg(feature = "tracy_images")]
             self.tracy_frame_captures.clone(),
         );
@@ -563,6 +565,16 @@ fn backend_try_order(preferred_backends: wgpu::Backends) -> Vec<wgpu::Backends> 
     for backend in wgpu::Backends::all() - preferred_backends {
         order.push(backend);
     }
+
+    // 32-bit Windows: DX12 frequently fails CreatePipelineState with
+    // E_INVALIDARG (0x80070057), and a half-initialized DX12 stack can leave
+    // the process in a bad state. Prefer GL first, then the rest.
+    #[cfg(all(windows, target_pointer_width = "32"))]
+    {
+        order.retain(|b| *b != wgpu::Backends::GL);
+        order.insert(0, wgpu::Backends::GL);
+    }
+
     order
 }
 
@@ -715,8 +727,8 @@ fn try_wgpu_backend(backend: wgpu::Backends, window: Arc<Window>) -> Option<wgpu
     }
 }
 
-// Load fallback fonts
-fn load_system_fonts(
+/// Load fallback fonts for egui.
+pub(crate) fn load_system_fonts(
     font_database: &Database,
     locale: unic_langid::LanguageIdentifier,
 ) -> egui::FontDefinitions {
