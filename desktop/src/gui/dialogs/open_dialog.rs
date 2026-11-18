@@ -2,8 +2,10 @@ use crate::custom_event::RuffleEvent;
 use crate::gui::widgets::path_or_url_field::PathOrUrlField;
 use crate::gui::{FilePicker, LocalizableText, text};
 use crate::player::LaunchOptions;
+use crate::preferences::GlobalPreferences;
 use egui::{
-    Align2, Button, Checkbox, ComboBox, Grid, Layout, Slider, TextEdit, Ui, Widget, Window, emath,
+    Align2, Button, Checkbox, ComboBox, Grid, Layout, ScrollArea, Slider, TextEdit, Ui, Widget,
+    Window, emath,
 };
 use ruffle_core::backend::navigator::SocketMode;
 use ruffle_core::config::Letterbox;
@@ -12,6 +14,7 @@ use ruffle_core::{
     StageScaleMode,
 };
 use ruffle_frontend_utils::content::ContentDescriptor;
+use ruffle_frontend_utils::recents::Recent;
 use ruffle_render::quality::StageQuality;
 use std::borrow::Cow;
 use std::ops::RangeInclusive;
@@ -20,9 +23,18 @@ use unic_langid::LanguageIdentifier;
 use url::Url;
 use winit::event_loop::EventLoopProxy;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenDialogTab {
+    Recents,
+    Open,
+}
+
 pub struct OpenDialog {
     options: LaunchOptions,
     event_loop: EventLoopProxy<RuffleEvent>,
+    preferences: GlobalPreferences,
+    active_tab: OpenDialogTab,
+    cached_recents: Vec<Recent>,
 
     // These are outside of PlayerOptions as it can be an invalid value (ie URL) during typing,
     // and we don't want to clear the value if the user, ie, toggles the checkbox.
@@ -55,7 +67,15 @@ impl OpenDialog {
         default_content: Option<ContentDescriptor>,
         picker: FilePicker,
         event_loop: EventLoopProxy<RuffleEvent>,
+        preferences: GlobalPreferences,
     ) -> Self {
+        let cached_recents = load_available_recents(&preferences);
+        let active_tab = if cached_recents.is_empty() {
+            OpenDialogTab::Open
+        } else {
+            OpenDialogTab::Recents
+        };
+
         let spoof_url = OptionalField::new(
             defaults.player.spoof_url.as_ref().map(Url::to_string),
             UrlField::new("https://example.org/game.swf"),
@@ -269,6 +289,9 @@ impl OpenDialog {
         Self {
             options: defaults,
             event_loop,
+            preferences,
+            active_tab,
+            cached_recents,
             spoof_url,
             referer,
             cookie,
@@ -291,12 +314,30 @@ impl OpenDialog {
         }
     }
 
+    /// Refresh recents and pick the default tab before showing the dialog.
+    pub fn prepare_for_display(&mut self) {
+        self.cached_recents = load_available_recents(&self.preferences);
+        self.active_tab = if self.cached_recents.is_empty() {
+            OpenDialogTab::Open
+        } else {
+            OpenDialogTab::Recents
+        };
+    }
+
     pub fn content_descriptor(&self) -> Option<ContentDescriptor> {
         self.path.result()
     }
 
     pub fn options(&self) -> &LaunchOptions {
         &self.options
+    }
+
+    fn open_content(&self, content: ContentDescriptor) -> bool {
+        let mut launch_options = self.options.clone();
+        launch_options.custom_title = None;
+        self.event_loop
+            .send_event(RuffleEvent::Open(content, Box::new(launch_options)))
+            .is_ok()
     }
 
     fn start(&mut self) -> bool {
@@ -306,65 +347,109 @@ impl OpenDialog {
             self.options.player.frame_rate = None;
         }
 
-        if let Some(result) = self.path.result() {
-            let mut launch_options = self.options.clone();
-            launch_options.custom_title = None;
-            if self
-                .event_loop
-                .send_event(RuffleEvent::Open(result, Box::new(launch_options)))
-                .is_ok()
-            {
-                return true;
-            }
-        }
-
-        false
+        self.path
+            .result()
+            .is_some_and(|result| self.open_content(result))
     }
 
     pub fn show(&mut self, locale: &LanguageIdentifier, egui_ctx: &egui::Context) -> bool {
         let mut keep_open = true;
         let mut should_close = false;
         let mut is_valid = true;
+        let mut open_recent: Option<ContentDescriptor> = None;
 
         Window::new(text(locale, "open-dialog"))
             .open(&mut keep_open)
             .anchor(Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .collapsible(false)
-            .default_width(200.0)
+            .default_width(420.0)
             .show(egui_ctx, |ui| {
-                ui.vertical_centered_justified(|ui| {
-                    Grid::new("open-file-options")
-                        .num_columns(1)
-                        .striped(true)
-                        .show(ui, |ui| {
-                            is_valid &= self.path.ui(locale, ui).result().is_some();
-                            ui.end_row();
-                        });
-                });
-
-                ui.collapsing(text(locale, "network-settings"), |ui| {
-                    is_valid &= self.network_settings(locale, ui);
-                });
-
-                ui.collapsing(text(locale, "player-settings"), |ui| {
-                    self.player_settings(locale, ui);
-                });
-
-                ui.collapsing(text(locale, "movie-parameters"), |ui| {
-                    self.movie_parameters(locale, ui);
-                });
-
                 ui.horizontal(|ui| {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add_enabled(is_valid, Button::new(text(locale, "start")))
-                            .clicked()
-                        {
-                            should_close = self.start();
-                        }
-                    })
+                    ui.selectable_value(
+                        &mut self.active_tab,
+                        OpenDialogTab::Recents,
+                        text(locale, "open-dialog-tab-recents"),
+                    );
+                    ui.selectable_value(
+                        &mut self.active_tab,
+                        OpenDialogTab::Open,
+                        text(locale, "open-dialog-tab-open"),
+                    );
                 });
+                ui.separator();
+
+                match self.active_tab {
+                    OpenDialogTab::Recents => {
+                        if self.cached_recents.is_empty() {
+                            ui.label(text(locale, "open-dialog-recents-empty"));
+                        } else {
+                            ScrollArea::vertical()
+                                .id_salt("open-dialog-recents")
+                                .max_height(280.0)
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| {
+                                    ui.set_min_width(ui.available_width());
+                                    for recent in &self.cached_recents {
+                                        let response = ui.add_sized(
+                                            [ui.available_width(), 0.0],
+                                            Button::new(&recent.name)
+                                                .frame(true)
+                                                .wrap_mode(egui::TextWrapMode::Truncate),
+                                        );
+                                        let url_text = recent.content_descriptor.url.as_str();
+                                        response.clone().on_hover_text(url_text);
+                                        if response.clicked() {
+                                            open_recent =
+                                                Some(recent.content_descriptor.clone());
+                                        }
+                                        ui.add_space(2.0);
+                                    }
+                                });
+                        }
+                    }
+                    OpenDialogTab::Open => {
+                        ui.vertical_centered_justified(|ui| {
+                            Grid::new("open-file-options")
+                                .num_columns(1)
+                                .striped(true)
+                                .show(ui, |ui| {
+                                    is_valid &= self.path.ui(locale, ui).result().is_some();
+                                    ui.end_row();
+                                });
+                        });
+
+                        ui.collapsing(text(locale, "network-settings"), |ui| {
+                            is_valid &= self.network_settings(locale, ui);
+                        });
+
+                        ui.collapsing(text(locale, "player-settings"), |ui| {
+                            self.player_settings(locale, ui);
+                        });
+
+                        ui.collapsing(text(locale, "movie-parameters"), |ui| {
+                            self.movie_parameters(locale, ui);
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .add_enabled(is_valid, Button::new(text(locale, "start")))
+                                        .clicked()
+                                    {
+                                        should_close = self.start();
+                                    }
+                                },
+                            )
+                        });
+                    }
+                }
             });
+
+        if let Some(content) = open_recent {
+            should_close = self.open_content(content);
+        }
 
         keep_open && !should_close
     }
@@ -921,4 +1006,15 @@ impl<Inner: InnerField> OptionalField<Inner> {
     pub fn is_valid(&self) -> bool {
         !self.error
     }
+}
+
+fn load_available_recents(preferences: &GlobalPreferences) -> Vec<Recent> {
+    preferences.recents(|recents| {
+        recents
+            .iter()
+            .rev()
+            .filter(|x| !x.is_invalid() && x.is_available())
+            .cloned()
+            .collect()
+    })
 }

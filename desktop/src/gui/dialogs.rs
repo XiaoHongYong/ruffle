@@ -100,6 +100,7 @@ impl Dialogs {
                 default_content,
                 picker.clone(),
                 event_loop.clone(),
+                preferences.clone(),
             ),
             is_open_dialog_visible: false,
 
@@ -135,11 +136,17 @@ impl Dialogs {
         event_loop: EventLoopProxy<RuffleEvent>,
     ) {
         self.is_open_dialog_visible = false;
-        self.open_dialog =
-            OpenDialog::new(opt, content_descriptor, self.picker.clone(), event_loop);
+        self.open_dialog = OpenDialog::new(
+            opt,
+            content_descriptor,
+            self.picker.clone(),
+            event_loop,
+            self.preferences.clone(),
+        );
     }
 
     pub fn open_file_advanced(&mut self) {
+        self.open_dialog.prepare_for_display();
         self.is_open_dialog_visible = true;
     }
 
