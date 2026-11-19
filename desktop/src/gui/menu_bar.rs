@@ -3,7 +3,11 @@ use crate::gui::dialogs::Dialogs;
 use crate::gui::{DebugMessage, text};
 use crate::player::LaunchOptions;
 use crate::preferences::GlobalPreferences;
-use egui::{Button, Key, KeyboardShortcut, Modifiers, Widget};
+use egui::menu::MenuConfig;
+use egui::{
+    Button, Id, InnerResponse, IntoAtoms, Key, KeyboardShortcut, Modifiers, Popup, SetOpenCommand,
+    UiKind, UiStackInfo, Widget,
+};
 use ruffle_core::config::Letterbox;
 use ruffle_core::focus_tracker::DisplayObject;
 use ruffle_core::{Player, StageScaleMode};
@@ -12,6 +16,53 @@ use ruffle_frontend_utils::recents::Recent;
 use ruffle_render::quality::StageQuality;
 use unic_langid::LanguageIdentifier;
 use winit::event_loop::EventLoopProxy;
+
+/// Id salt for remembering which top-level menu is open in the menu bar.
+///
+/// egui 0.36 lost the usual "once a menu is open, hovering another title switches
+/// to it" behavior (fixed upstream in egui#7802 / 0.37). We recreate it here.
+const MENU_BAR_OPEN_MENU_ID: &str = "ruffle_menu_bar_open_menu";
+
+/// Top-level menu button that switches on hover when another menu is already open.
+fn bar_menu_button<'a, R>(
+    ui: &mut egui::Ui,
+    atoms: impl IntoAtoms<'a>,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> InnerResponse<Option<R>> {
+    let response = Button::new(atoms).ui(ui);
+    let found = MenuConfig::find(ui);
+    // `MenuConfig::bar` is private; start from defaults (bar=false) and keep style/behavior.
+    let config = MenuConfig::new()
+        .close_behavior(found.close_behavior)
+        .style(found.style);
+
+    let mut menu = Popup::menu(&response);
+    let popup_id = menu.get_id();
+    let bar_open_menu_id = Id::new(MENU_BAR_OPEN_MENU_ID);
+
+    if response.hovered() && !response.clicked() {
+        let open_menu_in_bar = ui.data(|d| d.get_temp::<Id>(bar_open_menu_id));
+        if let Some(open_menu_in_bar) = open_menu_in_bar
+            && open_menu_in_bar != popup_id
+            && Popup::is_id_open(ui.ctx(), open_menu_in_bar)
+        {
+            // Opening a popup replaces the previously open one in egui memory.
+            menu = menu.open_memory(Some(SetOpenCommand::Bool(true)));
+        }
+    }
+
+    let inner = menu
+        .close_behavior(config.close_behavior)
+        .style(config.style.clone())
+        .info(UiStackInfo::new(UiKind::Menu).with_tag_value(MenuConfig::MENU_CONFIG_TAG, config))
+        .show(add_contents);
+
+    if inner.is_some() {
+        ui.data_mut(|d| d.insert_temp(bar_open_menu_id, popup_id));
+    }
+
+    InnerResponse::new(inner.map(|r| r.inner), response)
+}
 
 pub struct MenuBar {
     event_loop: EventLoopProxy<RuffleEvent>,
@@ -102,7 +153,7 @@ impl MenuBar {
                 self.file_menu(locale, ui, dialogs, player.is_some());
                 self.view_menu(locale, ui, &mut player);
                 self.controls_menu(locale, ui, dialogs, &mut player);
-                ui.menu_button( text(locale, "bookmarks-menu"), |ui| {
+                bar_menu_button(ui, text(locale, "bookmarks-menu"), |ui| {
                     if Button::new(text(locale, "bookmarks-menu-add")).ui(ui).clicked() {
                         ui.close();
 
@@ -132,7 +183,7 @@ impl MenuBar {
                         });
                     }
                 });
-                ui.menu_button(text(locale, "debug-menu"), |ui| {
+                bar_menu_button(ui, text(locale, "debug-menu"), |ui| {
                     ui.add_enabled_ui(player.is_some(), |ui| {
                         if Button::new(text(locale, "debug-menu-open-stage")).ui(ui).clicked() {
                             ui.close();
@@ -179,7 +230,7 @@ impl MenuBar {
                         }
                     });
                 });
-                ui.menu_button(text(locale, "help-menu"), |ui| {
+                bar_menu_button(ui, text(locale, "help-menu"), |ui| {
                     if ui.button(text(locale, "help-menu-join-discord")).clicked() {
                         self.launch_website(ui, "https://discord.gg/ruffle");
                     }
@@ -209,7 +260,7 @@ impl MenuBar {
         dialogs: &mut Dialogs,
         player_exists: bool,
     ) {
-        ui.menu_button(text(locale, "file-menu"), |ui| {
+        bar_menu_button(ui, text(locale, "file-menu"), |ui| {
             if Button::new(text(locale, "file-menu-open-file"))
                 .shortcut_text(ui.ctx().format_shortcut(&Self::SHORTCUT_OPEN))
                 .ui(ui)
@@ -332,7 +383,7 @@ impl MenuBar {
         ui: &mut egui::Ui,
         player: &mut Option<&mut Player>,
     ) {
-        ui.menu_button(text(locale, "view-menu"), |ui| {
+        bar_menu_button(ui, text(locale, "view-menu"), |ui| {
             ui.add_enabled_ui(player.is_some(), |ui| {
                 ui.menu_button(text(locale, "scale-mode"), |ui| {
                     let items = [
@@ -455,7 +506,7 @@ impl MenuBar {
         dialogs: &mut Dialogs,
         player: &mut Option<&mut Player>,
     ) {
-        ui.menu_button(text(locale, "controls-menu"), |ui| {
+        bar_menu_button(ui, text(locale, "controls-menu"), |ui| {
             ui.add_enabled_ui(player.is_some(), |ui| {
                 let playing = player.as_ref().map(|p| p.is_playing()).unwrap_or_default();
                 let btn_name = if playing {
